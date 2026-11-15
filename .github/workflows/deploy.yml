@@ -1,0 +1,112 @@
+# tasdelenkurban.com otomatik yayın
+# main dalında dist/ değişince, yalnızca değişen dosyaları SFTP ile sunucuya gönderir
+# ve Cloudflare önbelleğinde yalnızca onları temizler.
+# Elle tam yayın: Actions > "Siteyi yayinla" > Run workflow (tüm dist/ gönderilir).
+# Secrets: DEPLOY_HOST, DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS, CF_API_TOKEN
+name: Siteyi yayinla
+
+on:
+  push:
+    branches: [main]
+    paths: ["dist/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REMOTE_DIR: /var/www/tasdelenkurb_usr/data/www/tasdelenkurban.com
+  REMOTE_USER: tasdelenkurb_usr
+  REMOTE_PORT: "2398"
+  CF_ZONE_ID: 98defb2cb0ec7b81374fa290ab57c2a3
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Degisen dosyalari belirle
+        env:
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          git config core.quotePath false
+          if [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            git diff --no-renames --name-only --diff-filter=AMT "$BEFORE" HEAD -- dist > upload.txt
+            git diff --no-renames --name-only --diff-filter=D "$BEFORE" HEAD -- dist > delete.txt
+          else
+            echo "Tam yayin: dist/ altindaki tum dosyalar gonderilecek"
+            git ls-files -- dist > upload.txt
+            : > delete.txt
+          fi
+          echo "Gonderilecek: $(wc -l < upload.txt) dosya, silinecek: $(wc -l < delete.txt) dosya"
+          cat upload.txt delete.txt
+
+          : > batch.txt
+          while IFS= read -r f; do
+            rel="${f#dist/}"
+            d=$(dirname "$rel")
+            if [ "$d" != "." ]; then
+              p=""
+              IFS=/ read -ra parts <<< "$d"
+              for part in "${parts[@]}"; do
+                p="$p/$part"
+                echo "-mkdir \"$REMOTE_DIR$p\"" >> batch.txt
+              done
+            fi
+            echo "put \"$f\" \"$REMOTE_DIR/$rel\"" >> batch.txt
+          done < upload.txt
+          while IFS= read -r f; do
+            echo "-rm \"$REMOTE_DIR/${f#dist/}\"" >> batch.txt
+          done < delete.txt
+
+      - name: SFTP ile sunucuya gonder
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          if [ ! -s batch.txt ]; then echo "Gonderilecek degisiklik yok"; exit 0; fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          sftp -b batch.txt -P "$REMOTE_PORT" -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$REMOTE_USER@$HOST"
+          rm -f ~/.ssh/deploy_key
+
+      - name: Cloudflare onbellegini temizle
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          cat upload.txt delete.txt | python3 -c '
+          import json, os, sys, urllib.parse, urllib.request
+          files = [l.rstrip("\n")[len("dist/"):] for l in sys.stdin if l.strip()]
+          if not files:
+              print("Temizlenecek dosya yok"); sys.exit(0)
+          urls = []
+          for f in files:
+              p = "/" + urllib.parse.quote(f)
+              paths = [p] + ([p[: -len("index.html")]] if p.endswith("/index.html") else [])
+              urls += [f"{s}://{h}{q}" for q in paths for s in ("https", "http")
+                       for h in ("www.tasdelenkurban.com", "tasdelenkurban.com")]
+          zone, token = os.environ["CF_ZONE_ID"], os.environ["CF_API_TOKEN"]
+          for i in range(0, len(urls), 30):
+              req = urllib.request.Request(
+                  f"https://api.cloudflare.com/client/v4/zones/{zone}/purge_cache",
+                  data=json.dumps({"files": urls[i:i + 30]}).encode(), method="POST",
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+              res = json.load(urllib.request.urlopen(req, timeout=30))
+              if not res.get("success"):
+                  sys.exit("Cloudflare hatasi: " + str(res.get("errors")))
+          print(f"Cloudflare onbellegi temizlendi: {len(files)} dosya")
+          '
